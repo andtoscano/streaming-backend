@@ -7,8 +7,10 @@ import logging
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 import httpx
+from functools import lru_cache
+import time
 
 load_dotenv()
 
@@ -21,6 +23,36 @@ db = client[db_name]
 # TMDB API Configuration
 TMDB_API_KEY = os.environ.get('TMDB_API_KEY', '')
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
+
+# === CACHE SYSTEM ===
+# Simple in-memory cache with expiration
+class SimpleCache:
+    def __init__(self, default_ttl=3600):  # 1 hour default
+        self._cache = {}
+        self._timestamps = {}
+        self.default_ttl = default_ttl
+    
+    def get(self, key):
+        if key in self._cache:
+            if time.time() - self._timestamps[key] < self.default_ttl:
+                return self._cache[key]
+            else:
+                # Expired, remove it
+                del self._cache[key]
+                del self._timestamps[key]
+        return None
+    
+    def set(self, key, value, ttl=None):
+        self._cache[key] = value
+        self._timestamps[key] = time.time()
+    
+    def clear(self):
+        self._cache.clear()
+        self._timestamps.clear()
+
+# Initialize caches
+search_cache = SimpleCache(default_ttl=1800)  # 30 minutes for searches
+provider_cache = SimpleCache(default_ttl=3600)  # 1 hour for providers
 
 # Create the main app
 app = FastAPI(title="E 'ndoe l'è che la se trova? API")
@@ -72,12 +104,23 @@ async def root():
 
 @api_router.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    return {"status": "healthy", "cache_enabled": True}
 
 @api_router.get("/search", response_model=List[SearchResult])
 async def search_content(query: str = Query(..., min_length=1)):
     if not TMDB_API_KEY:
         raise HTTPException(status_code=500, detail="TMDB API key not configured")
+    
+    # Normalize query for cache key
+    cache_key = f"search:{query.lower().strip()}"
+    
+    # Check cache first
+    cached_result = search_cache.get(cache_key)
+    if cached_result is not None:
+        logger.info(f"Cache HIT for search: {query}")
+        return cached_result
+    
+    logger.info(f"Cache MISS for search: {query}")
     
     async with httpx.AsyncClient() as http_client:
         try:
@@ -90,7 +133,7 @@ async def search_content(query: str = Query(..., min_length=1)):
                     "region": "IT",
                     "include_adult": False
                 },
-                timeout=10.0
+                timeout=15.0
             )
             response.raise_for_status()
             data = response.json()
@@ -112,14 +155,19 @@ async def search_content(query: str = Query(..., min_length=1)):
                         vote_average=item.get("vote_average")
                     ))
             
-            # Save search to history
+            results = results[:20]
+            
+            # Save to cache
+            search_cache.set(cache_key, results)
+            
+            # Save search to history (non-blocking)
             try:
                 search_history = SearchHistory(query=query, results_count=len(results))
                 await db.search_history.insert_one(search_history.dict())
             except:
-                pass  # Don't fail if DB is not available
+                pass
             
-            return results[:20]
+            return results
             
         except httpx.HTTPStatusError as e:
             raise HTTPException(status_code=e.response.status_code, detail="Error fetching from TMDB")
@@ -134,13 +182,22 @@ async def get_watch_providers(media_type: str, content_id: int):
     if media_type not in ["movie", "tv"]:
         raise HTTPException(status_code=400, detail="media_type must be 'movie' or 'tv'")
     
+    # Check cache first
+    cache_key = f"providers:{media_type}:{content_id}"
+    cached_result = provider_cache.get(cache_key)
+    if cached_result is not None:
+        logger.info(f"Cache HIT for providers: {media_type}/{content_id}")
+        return cached_result
+    
+    logger.info(f"Cache MISS for providers: {media_type}/{content_id}")
+    
     async with httpx.AsyncClient() as http_client:
         try:
             # Get content details
             details_response = await http_client.get(
                 f"{TMDB_BASE_URL}/{media_type}/{content_id}",
                 params={"api_key": TMDB_API_KEY, "language": "it-IT"},
-                timeout=10.0
+                timeout=15.0
             )
             details_response.raise_for_status()
             details = details_response.json()
@@ -152,7 +209,7 @@ async def get_watch_providers(media_type: str, content_id: int):
             providers_response = await http_client.get(
                 f"{TMDB_BASE_URL}/{media_type}/{content_id}/watch/providers",
                 params={"api_key": TMDB_API_KEY},
-                timeout=10.0
+                timeout=15.0
             )
             providers_response.raise_for_status()
             providers_data = providers_response.json()
@@ -169,7 +226,7 @@ async def get_watch_providers(media_type: str, content_id: int):
                     for p in providers_list
                 ]
             
-            return WatchProviderResult(
+            result = WatchProviderResult(
                 content_id=content_id,
                 content_title=title or "Unknown",
                 media_type=media_type,
@@ -180,10 +237,22 @@ async def get_watch_providers(media_type: str, content_id: int):
                 link=italy_providers.get("link")
             )
             
+            # Save to cache
+            provider_cache.set(cache_key, result)
+            
+            return result
+            
         except httpx.HTTPStatusError as e:
             raise HTTPException(status_code=e.response.status_code, detail="Error fetching from TMDB")
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
+# Clear cache endpoint (for admin use)
+@api_router.delete("/cache")
+async def clear_cache():
+    search_cache.clear()
+    provider_cache.clear()
+    return {"message": "Cache cleared"}
 
 # Include router
 app.include_router(api_router)
